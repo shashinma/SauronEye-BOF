@@ -12,7 +12,7 @@ A file search tool ported from SauronEye to BOF format. Searches directories for
 sauroneye [-d directories] [-f filetypes] [-k keywords] [-c] [-m maxfilesize] [-s] [-b beforedate] [-a afterdate] [-v] [-D] [-W wildcardattempts] [-S wildcardsize] [-B wildcardbacktrack]
 ```
 
-Options:
+#### Options:
 - `-d directories`: Comma-separated list of directories to search (default: C:\)
 - `-f filetypes`: Comma-separated list of file extensions (default: .txt,.docx)
 - `-k keywords`: Comma-separated list of keywords with wildcards (default: none - matches all filenames). Used for searching in filenames and/or file contents
@@ -27,7 +27,7 @@ Options:
 - `-S wildcardsize`: Maximum search area in KB for large files when using wildcards (default: 200KB). Increase to search more of large files
 - `-B wildcardbacktrack`: Maximum backtracking operations for wildcard matching (default: 1000). Increase for complex patterns
 
-Examples:
+#### Examples:
 ```
 # Search only on C:\ drive (default)
 sauroneye -f .docx

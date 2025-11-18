@@ -180,14 +180,43 @@ static void FormatFileDate(const FILETIME* creationTime, const FILETIME* modific
         st_creation.wDay, st_creation.wMonth, st_creation.wYear,
         st_modification.wDay, st_modification.wMonth, st_modification.wYear);
 }
-static BOOL OutputSearchResult(const char* filepath, const FILETIME* filetime, const char* matchStart, const char* matchEnd, const char* lowercaseBuffer, const char* originalBuffer, DWORD bufferLen, SearchOptions* opts) {
-    if (opts && IsPathAlreadySeen(filepath, opts)) {
-        return FALSE; 
-    }
+static BOOL OutputSearchResult(const char* filepath, const FILETIME* filetime, const char* matchStart, const char* matchEnd, const char* lowercaseBuffer, const char* originalBuffer, DWORD bufferLen, SearchOptions* opts, DWORD* seenOffsets, int* seenOffsetsCount, int seenOffsetsCapacity) {
+    if (!opts) return FALSE;
+    
     size_t len = MSVCRT$strlen(filepath);
     char* normalized = (char*)MSVCRT$malloc(len + 1);
+    if (!normalized) {
+        normalized = (char*)filepath; // Fallback to original path
+    } else {
+        MSVCRT$memcpy(normalized, filepath, len + 1);
+        NormalizePath(normalized);
+    }
+    
+    BOOL alreadySeen = IsPathAlreadySeen(normalized, opts);
+    
+    // Check if this match position was already output
+    if (matchStart && matchEnd && seenOffsets && seenOffsetsCount) {
+        size_t matchStartOffset = matchStart - lowercaseBuffer;
+        size_t matchEndOffset = matchEnd - lowercaseBuffer;
+        // Check if we've already output a match at this exact position or overlapping position
+        for (int i = 0; i < *seenOffsetsCount; i++) {
+            // Check if positions overlap (within a small tolerance to account for context differences)
+            DWORD startDiff = (matchStartOffset > seenOffsets[i]) ? (matchStartOffset - seenOffsets[i]) : (seenOffsets[i] - matchStartOffset);
+            if (startDiff <= CONTEXT_BUFFER_SIZE) {
+                // This match overlaps with an already output match, skip it
+                if (normalized != filepath) MSVCRT$free(normalized);
+                return FALSE;
+            }
+        }
+        // Add this position to seen offsets
+        if (*seenOffsetsCount < seenOffsetsCapacity) {
+            seenOffsets[*seenOffsetsCount] = (DWORD)matchStartOffset;
+            (*seenOffsetsCount)++;
+        }
+    }
+    
     char dateStr[35] = {0}; 
-    if (opts && opts->show_date && filetime) {
+    if (opts->show_date && filetime) {
         WIN32_FILE_ATTRIBUTE_DATA fileInfo;
         FILETIME creationTime = *filetime; 
         if (KERNEL32$GetFileAttributesExA(filepath, GetFileExInfoStandard, &fileInfo)) {
@@ -195,17 +224,32 @@ static BOOL OutputSearchResult(const char* filepath, const FILETIME* filetime, c
         }
         FormatFileDate(&creationTime, filetime, dateStr, sizeof(dateStr));
     }
-    if (!normalized) { 
-        if (opts && opts->show_date && dateStr[0]) {
-            BeaconPrintf(CALLBACK_OUTPUT, "\n[+] %s %s\n", dateStr, filepath);
-        } else {
-            BeaconPrintf(CALLBACK_OUTPUT, "\n[+] %s\n", filepath);
+    
+    // If file was already seen and we have a match, only output the match context
+    if (alreadySeen && matchStart && matchEnd && originalBuffer) {
+        size_t matchStartOffset = matchStart - lowercaseBuffer;
+        size_t matchEndOffset = matchEnd - lowercaseBuffer;
+        size_t contextStartOffset = (matchStartOffset < CONTEXT_BUFFER_SIZE) ? 0 : matchStartOffset - CONTEXT_BUFFER_SIZE;
+        size_t contextEndOffset = (matchEndOffset + CONTEXT_BUFFER_SIZE > bufferLen) ? bufferLen : matchEndOffset + CONTEXT_BUFFER_SIZE;
+        size_t ctxLen = contextEndOffset - contextStartOffset;
+        char* ctx = (char*)MSVCRT$malloc(ctxLen + 1);
+        if (ctx) {
+            MSVCRT$memcpy(ctx, originalBuffer + contextStartOffset, ctxLen);
+            ctx[ctxLen] = '\0';
+            BeaconPrintf(CALLBACK_OUTPUT, "\t ...%s...\n", ctx);
+            MSVCRT$free(ctx);
         }
-        if (opts) AddPathToSeen(filepath, opts);
-        return TRUE; 
+        if (normalized != filepath) MSVCRT$free(normalized);
+        return TRUE;
     }
-    MSVCRT$memcpy(normalized, filepath, len + 1);
-    NormalizePath(normalized);
+    
+    // If file was already seen and no match, skip
+    if (alreadySeen) {
+        if (normalized != filepath) MSVCRT$free(normalized);
+        return FALSE;
+    }
+    
+    // File not seen yet - output full result
     if (matchStart && matchEnd && originalBuffer) {
         size_t matchStartOffset = matchStart - lowercaseBuffer;
         size_t matchEndOffset = matchEnd - lowercaseBuffer;
@@ -216,28 +260,29 @@ static BOOL OutputSearchResult(const char* filepath, const FILETIME* filetime, c
         if (ctx) {
             MSVCRT$memcpy(ctx, originalBuffer + contextStartOffset, ctxLen);
             ctx[ctxLen] = '\0';
-            if (opts && opts->show_date && dateStr[0]) {
+            if (opts->show_date && dateStr[0]) {
                 BeaconPrintf(CALLBACK_OUTPUT, "\n[+] %s %s:\n\t ...%s...\n", dateStr, normalized, ctx);
             } else {
                 BeaconPrintf(CALLBACK_OUTPUT, "\n[+] %s:\n\t ...%s...\n", normalized, ctx);
             }
             MSVCRT$free(ctx);
         } else {
-            if (opts && opts->show_date && dateStr[0]) {
+            if (opts->show_date && dateStr[0]) {
                 BeaconPrintf(CALLBACK_OUTPUT, "\n[+] %s %s\n", dateStr, normalized);
             } else {
                 BeaconPrintf(CALLBACK_OUTPUT, "\n[+] %s\n", normalized);
             }
         }
     } else {
-        if (opts && opts->show_date && dateStr[0]) {
+        if (opts->show_date && dateStr[0]) {
             BeaconPrintf(CALLBACK_OUTPUT, "\n[+] %s %s\n", dateStr, normalized);
         } else {
             BeaconPrintf(CALLBACK_OUTPUT, "\n[+] %s\n", normalized);
         }
     }
-    if (opts) AddPathToSeen(normalized, opts);
-    MSVCRT$free(normalized);
+    
+    AddPathToSeen(normalized, opts);
+    if (normalized != filepath) MSVCRT$free(normalized);
     return TRUE;
 }
 BOOL MatchesDateFilter(const FILETIME* filetime, SearchOptions* opts) {
@@ -306,6 +351,14 @@ int SearchFileContents(const char* filepath, const FILETIME* filetime, SearchOpt
             lowerKeywords[i] = NULL;
         }
     }
+    // Track seen match offsets to avoid duplicate output
+    DWORD* seenOffsets = (DWORD*)MSVCRT$malloc(sizeof(DWORD) * MAX_MATCHES_PER_FILE);
+    int seenOffsetsCount = 0;
+    int seenOffsetsCapacity = MAX_MATCHES_PER_FILE;
+    if (!seenOffsets) {
+        seenOffsetsCapacity = 0;
+    }
+    
     int totalMatches = 0;  
     for (int i = 0; i < opts->keyword_count; i++) {
         const char* kw = opts->keywords[i];
@@ -320,10 +373,18 @@ int SearchFileContents(const char* filepath, const FILETIME* filetime, SearchOpt
             while (*patternStart == '*' || *patternStart == '?') {
                 patternStart++;
             }
+            const char* patternEnd = lowerKeyword + keywordLen - 1;
+            BOOL endsWithStar = FALSE;
+            while (patternEnd >= lowerKeyword && (*patternEnd == '*' || *patternEnd == '?')) {
+                if (*patternEnd == '*') {
+                    endsWithStar = TRUE;
+                }
+                patternEnd--;
+            }
             if (!*patternStart) {
                 const char* matchStart = buffer;
                 const char* matchEnd = buffer + (bufferLen > 100 ? 100 : bufferLen); 
-                if (OutputSearchResult(filepath, filetime, matchStart, matchEnd, buffer, originalBuffer, (DWORD)bufferLen, opts)) {
+                if (OutputSearchResult(filepath, filetime, matchStart, matchEnd, buffer, originalBuffer, (DWORD)bufferLen, opts, seenOffsets, &seenOffsetsCount, seenOffsetsCapacity)) {
                     totalMatches++;
                 }
             } else {
@@ -347,13 +408,8 @@ int SearchFileContents(const char* filepath, const FILETIME* filetime, SearchOpt
                     const char* tryStart = startsWithWildcard && (searchStart - buffer) > maxBackward 
                         ? searchStart - maxBackward 
                         : (startsWithWildcard ? buffer : searchStart);
-                    BOOL foundMatch = FALSE;
-                    const char* matchStart = NULL;
-                    const char* matchEnd = NULL;
-                    const char* bestMatchStart = NULL;
-                    const char* bestMatchEnd = NULL;
-                    const char* actualMatchStart = NULL; 
-                    for (const char* testStart = tryStart; testStart <= searchStart; testStart++) {
+                    BOOL foundMatch = FALSE; 
+                    for (const char* testStart = tryStart; testStart <= searchStart && matchCount < MAX_MATCHES_PER_FILE; testStart++) {
                         const char* p = lowerKeyword;
                         const char* t = testStart;
                         const char* lastStar = NULL;
@@ -367,12 +423,17 @@ int SearchFileContents(const char* filepath, const FILETIME* filetime, SearchOpt
                             if (*p == '*') {
                                 while (*p == '*') p++;
                                 if (!*p) {
-                                    if (!bestMatchStart || testStart < bestMatchStart) {
-                                        bestMatchStart = testStart;
-                                        bestMatchEnd = t; 
-                                        actualMatchStart = firstLetterFound ? firstLetterPos : testStart;
-                                        foundMatch = TRUE;
+                                    const char* endPos = t;
+                                    while (endPos < maxSearchPos && IsAlphanumeric(*endPos)) {
+                                        endPos++;
                                     }
+                                    const char* matchStartPos = firstLetterFound ? firstLetterPos : testStart;
+                                    if (OutputSearchResult(filepath, filetime, matchStartPos, endPos, buffer, originalBuffer, (DWORD)bufferLen, opts, seenOffsets, &seenOffsetsCount, seenOffsetsCapacity)) {
+                                        matchCount++;
+                                        totalMatches++;
+                                    }
+                                    foundMatch = TRUE;
+                                    matched = TRUE;
                                     break;
                                 }
                                 lastStar = p;
@@ -395,40 +456,28 @@ int SearchFileContents(const char* filepath, const FILETIME* filetime, SearchOpt
                                 break;
                             }
                         }
-                        if (!foundMatch || testStart < bestMatchStart) {
-                            while (*p == '*') p++;
-                            if (matched && !*p && t <= maxSearchPos) {
-                                if (IsWordBoundary(testStart, t, buffer, (DWORD)bufferLen, lowerKeyword)) {
-                                    if (!bestMatchStart || testStart < bestMatchStart) {
-                                        bestMatchStart = testStart;
-                                        bestMatchEnd = t;
-                                        actualMatchStart = firstLetterFound ? firstLetterPos : testStart;
-                                        foundMatch = TRUE;
+                        if (matched && !*p && t <= maxSearchPos) {
+                            BOOL boundaryCheck = TRUE;
+                            if (!endsWithStar) {
+                                boundaryCheck = IsWordBoundary(testStart, t, buffer, (DWORD)bufferLen, lowerKeyword);
+                            }
+                            if (boundaryCheck) {
+                                const char* endPos = t;
+                                if (endsWithStar) {
+                                    while (endPos < maxSearchPos && IsAlphanumeric(*endPos)) {
+                                        endPos++;
                                     }
                                 }
+                                const char* matchStartPos = firstLetterFound ? firstLetterPos : testStart;
+                                if (OutputSearchResult(filepath, filetime, matchStartPos, endPos, buffer, originalBuffer, (DWORD)bufferLen, opts, seenOffsets, &seenOffsetsCount, seenOffsetsCapacity)) {
+                                    matchCount++;
+                                    totalMatches++;
+                                }
+                                foundMatch = TRUE;
                             }
                         }
                     }
-                    if (foundMatch && bestMatchStart && bestMatchEnd) {
-                        matchStart = actualMatchStart ? actualMatchStart : bestMatchStart;
-                        matchEnd = bestMatchEnd;
-                    }
-                    if (foundMatch && matchStart && matchEnd) {
-                        if (OutputSearchResult(filepath, filetime, matchStart, matchEnd, buffer, originalBuffer, (DWORD)bufferLen, opts)) {
-                            matchCount++;
-                            totalMatches++;
-                        }
-                        const char* nextStart = matchEnd;
-                        if (nextStart <= matchStart) {
-                            nextStart = matchStart + 1;
-                        }
-                        if (nextStart <= searchStart) {
-                            nextStart = searchStart + 1;
-                        }
-                        searchStart = nextStart;
-                    } else {
-                        searchStart++;
-                    }
+                    searchStart++;
                     attempts++;
                 }
                 if (matchCount >= MAX_MATCHES_PER_FILE) {
@@ -448,7 +497,7 @@ int SearchFileContents(const char* filepath, const FILETIME* filetime, SearchOpt
                     (match[keywordLen] < 'a' || match[keywordLen] > 'z'));
                 if (isWordStart && isWordEnd) {
                     const char* matchEnd = match + keywordLen;
-                    if (OutputSearchResult(filepath, filetime, match, matchEnd, buffer, originalBuffer, bytesRead, opts)) {
+                    if (OutputSearchResult(filepath, filetime, match, matchEnd, buffer, originalBuffer, bytesRead, opts, seenOffsets, &seenOffsetsCount, seenOffsetsCapacity)) {
                         matchCount++;
                         totalMatches++;
                     }
@@ -466,6 +515,7 @@ int SearchFileContents(const char* filepath, const FILETIME* filetime, SearchOpt
     MSVCRT$free(lowerKeywords);
     MSVCRT$free(buffer);
     MSVCRT$free(originalBuffer);
+    if (seenOffsets) MSVCRT$free(seenOffsets);
     return totalMatches;
 }
 void SearchDirectory(const char* dir_path, SearchOptions* opts) {

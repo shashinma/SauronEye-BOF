@@ -6,80 +6,60 @@
 #include "../_include/beacon.h"
 
 
-// Dynamic OLE32 function pointers (static - internal use only)
-static PFN_StgIsStorageFile pStgIsStorageFile = NULL;
-static PFN_StgOpenStorage   pStgOpenStorage   = NULL;
-
-static void ensure_ole32_resolved() {
-    if (pStgIsStorageFile && pStgOpenStorage) return;
-    HMODULE hOle = KERNEL32$GetModuleHandleA("ole32.dll");
-    if (!hOle) return; // do not load explicitly to avoid new DLL loads
-    pStgIsStorageFile = (PFN_StgIsStorageFile) KERNEL32$GetProcAddress(hOle, "StgIsStorageFile");
-    pStgOpenStorage   = (PFN_StgOpenStorage)   KERNEL32$GetProcAddress(hOle, "StgOpenStorage");
-}
-
-// Binary-safe search for pattern in buffer
 static BOOL buffer_contains(const char* buf, DWORD len, const char* pat) {
     if (!buf || !pat) return FALSE;
     size_t plen = MSVCRT$strlen(pat);
     if (plen == 0 || len < (DWORD)plen) return FALSE;
-    for (DWORD i = 0; i + plen <= len; i++) {
-        if (buf[i] == pat[0]) {
+    const unsigned char first = (unsigned char)pat[0];
+    const DWORD max_pos = len - (DWORD)plen;
+    for (DWORD i = 0; i <= max_pos; i++) {
+        if ((unsigned char)buf[i] == first) {
+            if (plen > 1 && (unsigned char)buf[i + plen - 1] != (unsigned char)pat[plen - 1]) {
+                continue;
+            }
             DWORD j = 1;
-            for (; j < plen; j++) {
+            for (; j < plen - 1; j++) {
                 if ((unsigned char)buf[i + j] != (unsigned char)pat[j]) break;
             }
-            if (j == plen) return TRUE;
+            if (j == plen - 1) return TRUE;
         }
     }
     return FALSE;
 }
-
-// Strict VBA macro check (OOXML-only here). OLE path is disabled for stability
 BOOL CheckForVBAMacrosStrict(const char* filepath, BOOL use_ole) {
-    (void)use_ole; // OLE disabled by default; only OOXML detection is used
+    (void)use_ole;
     if (!filepath) return FALSE;
-
     HANDLE h = KERNEL32$CreateFileA(filepath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return FALSE;
-
     FILE_STANDARD_INFORMATION finfo = {0};
     IO_STATUS_BLOCK ios = {0};
-    NTSTATUS st = NTDLL$NtQueryInformationFile(h, &ios, &finfo, sizeof(finfo), FileStandardInformation);
-    if (st != 0 || finfo.EndOfFile.QuadPart == 0) { KERNEL32$CloseHandle(h); return FALSE; }
-
+    if (NTDLL$NtQueryInformationFile(h, &ios, &finfo, sizeof(finfo), FileStandardInformation) != 0 || finfo.EndOfFile.QuadPart == 0) {
+        KERNEL32$CloseHandle(h);
+        return FALSE;
+    }
     ULONGLONG total = (ULONGLONG)finfo.EndOfFile.QuadPart;
     DWORD win = (DWORD)((total > OOXML_SCAN_WINDOW) ? OOXML_SCAN_WINDOW : total);
-
     char* buf = (char*)MSVCRT$malloc(win);
     if (!buf) { KERNEL32$CloseHandle(h); return FALSE; }
-
-    // Read head via NtReadFile at offset 0
-    LARGE_INTEGER off; off.QuadPart = 0;
-    ios.Status = 0; ios.Information = 0;
-    st = NTDLL$NtReadFile(h, NULL, NULL, NULL, &ios, buf, win, &off, NULL);
-    if (st != 0 || ios.Information < 4) { MSVCRT$free(buf); KERNEL32$CloseHandle(h); return FALSE; }
-
-    BOOL isZip = (buf[0] == 'P' && buf[1] == 'K');
-    BOOL anyHit = buffer_contains(buf, (DWORD)ios.Information, "vbaProject.bin");
-
-    if (!anyHit && total > win) {
-        // Read tail via offset
-        off.QuadPart = (LONGLONG)(total - win);
-        ios.Status = 0; ios.Information = 0;
-        st = NTDLL$NtReadFile(h, NULL, NULL, NULL, &ios, buf, win, &off, NULL);
-        if (st == 0 && ios.Information >= 4) {
-            if (!isZip) isZip = (buf[0] == 'P' && buf[1] == 'K');
-            anyHit = buffer_contains(buf, (DWORD)ios.Information, "vbaProject.bin");
+    LARGE_INTEGER off = {0};
+    ios.Status = ios.Information = 0;
+    BOOL isZip = FALSE, anyHit = FALSE;
+    if (NTDLL$NtReadFile(h, NULL, NULL, NULL, &ios, buf, win, &off, NULL) == 0 && ios.Information >= 4) {
+        isZip = (buf[0] == 'P' && buf[1] == 'K');
+        anyHit = buffer_contains(buf, (DWORD)ios.Information, "vbaProject.bin");
+        if (!anyHit && total > win) {
+            off.QuadPart = (LONGLONG)(total - win);
+            ios.Status = ios.Information = 0;
+            if (NTDLL$NtReadFile(h, NULL, NULL, NULL, &ios, buf, win, &off, NULL) == 0 && ios.Information >= 4) {
+                if (!isZip) isZip = (buf[0] == 'P' && buf[1] == 'K');
+                anyHit = buffer_contains(buf, (DWORD)ios.Information, "vbaProject.bin");
+            }
         }
     }
-
     MSVCRT$free(buf);
     KERNEL32$CloseHandle(h);
     return (isZip && anyHit);
 }
-
-// Simple wildcard matching function (supports * and ?)
 BOOL MatchWildcard(const char* pattern, const char* str) {
     const char* s = str;
     const char* p = pattern;
@@ -94,8 +74,6 @@ BOOL MatchWildcard(const char* pattern, const char* str) {
     while (*p == '*') p++;
     return !*p;
 }
-
-// Check if keyword contains wildcard characters
 static BOOL HasWildcard(const char* str) {
     if (!str) return FALSE;
     for (const char* p = str; *p; p++) {
@@ -103,36 +81,67 @@ static BOOL HasWildcard(const char* str) {
     }
     return FALSE;
 }
-
+static BOOL IsAlphanumeric(char c) {
+    return ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'));
+}
+static BOOL IsWordBoundary(const char* matchStart, const char* matchEnd, const char* buffer, DWORD bufferLen, const char* pattern) {
+    const char* patternEnd = pattern + MSVCRT$strlen(pattern);
+    const char* p = patternEnd - 1;
+    BOOL endsWithStar = FALSE;
+    while (p >= pattern && (*p == '*' || *p == '?')) {
+        if (*p == '*') {
+            endsWithStar = TRUE;
+        }
+        p--;
+    }
+    if (endsWithStar) return TRUE;
+    BOOL startsWithWildcard = (*pattern == '*' || *pattern == '?');
+    if (!startsWithWildcard && matchStart > buffer) {
+        char prevChar = matchStart[-1];
+        if (IsAlphanumeric(prevChar)) return FALSE;
+    }
+    if (matchEnd < buffer + bufferLen) {
+        char nextChar = *matchEnd;
+        if (IsAlphanumeric(nextChar)) return FALSE;
+    }
+    return TRUE;
+}
 BOOL MatchesKeyword(const char* filename, SearchOptions* opts) {
     if (opts->keyword_count == 0) return TRUE;
+    const char* ext = MSVCRT$strrchr(filename, '.');
+    size_t nameLen = ext ? (size_t)(ext - filename) : MSVCRT$strlen(filename);
+    char* nameWithoutExt = (char*)MSVCRT$malloc(nameLen + 1);
+    if (!nameWithoutExt) return FALSE;
+    MSVCRT$memcpy(nameWithoutExt, filename, nameLen);
+    nameWithoutExt[nameLen] = '\0';
     for (int i = 0; i < opts->keyword_count; i++) {
         const char* kw = opts->keywords[i];
         if (!kw) continue;
-        
-        // If keyword contains wildcards, use wildcard matching
         if (HasWildcard(kw)) {
-            if (MatchWildcard(kw, filename)) return TRUE;
+            if (MatchWildcard(kw, nameWithoutExt)) {
+                MSVCRT$free(nameWithoutExt);
+                return TRUE;
+            }
         } else {
-            // Exact match (case-insensitive)
-            size_t flen = MSVCRT$strlen(filename);
-            size_t klen = MSVCRT$strlen(kw);
-            if (flen == klen) {
-                // Same length, compare case-insensitively
+            size_t kwlen = MSVCRT$strlen(kw);
+            if (nameLen == kwlen) {
                 BOOL match = TRUE;
-                for (size_t j = 0; j < klen; j++) {
+                for (size_t j = 0; j < kwlen; j++) {
                     if (MSVCRT$tolower((unsigned char)filename[j]) != MSVCRT$tolower((unsigned char)kw[j])) {
                         match = FALSE;
                         break;
                     }
                 }
-                if (match) return TRUE;
+                if (match) {
+                    MSVCRT$free(nameWithoutExt);
+                    return TRUE;
+                }
             }
         }
     }
+    MSVCRT$free(nameWithoutExt);
     return FALSE;
 }
-
 BOOL MatchesFiletype(const char* filepath, SearchOptions* opts) {
     const char* ext = MSVCRT$strrchr(filepath, '.');
     if (!ext) return FALSE;
@@ -141,527 +150,570 @@ BOOL MatchesFiletype(const char* filepath, SearchOptions* opts) {
     }
     return FALSE;
 }
-
-// Check if directory should be excluded
 BOOL IsFolderValid(const char* path, SearchOptions* opts) {
-    // If system_dirs flag is enabled, allow all directories
-    if (opts->system_dirs) {
-        return TRUE;
+    if (opts->system_dirs) return TRUE;
+    const char* p = path;
+    while (*p) {
+        if (*p == ':' && (p[1] == '\\')) {
+            const char* check = p + (p[2] == '\\' ? 3 : 2);
+            if (MSVCRT$strncmp(check, "Windows", 7) == 0 && (check[7] == '\0' || check[7] == '\\')) return FALSE;
+            if (MSVCRT$strncmp(check, "Program Files", 13) == 0) {
+                check += 13;
+                while (*check == '\\') check++;
+                if (*check == '\0' || *check == ' ') return FALSE;
+            }
+            if (MSVCRT$strncmp(check, "Users", 5) == 0) {
+                check += 5;
+                while (*check == '\\') check++;
+                if (MSVCRT$strstr(check, "AppData")) return FALSE;
+            }
+        }
+        p++;
     }
-    
-    // Normalize path by creating a copy and replacing double backslashes
-    size_t len = MSVCRT$strlen(path);
-    char* normalized_path = (char*)MSVCRT$malloc(len + 1);
-    if (!normalized_path) return TRUE; // If malloc fails, allow the path
-    
-    MSVCRT$memcpy(normalized_path, path, len + 1);
-    NormalizePath(normalized_path);
-    
-    // Exclude root-level system directories only (not subdirectories of user-specified paths)
-    // Check for exact root-level matches: C:\Windows, C:\Program Files, etc.
-    if (MSVCRT$strstr(normalized_path, ":\\Windows") && 
-        (MSVCRT$strlen(normalized_path) <= 10 || normalized_path[10] == '\\' || normalized_path[10] == '\0')) {
-        MSVCRT$free(normalized_path);
-        return FALSE;
+    return TRUE;
+}
+static void FormatFileDate(const FILETIME* creationTime, const FILETIME* modificationTime, char* dateStr, size_t dateStrSize) {
+    SYSTEMTIME st_creation, st_modification;
+    KERNEL32$FileTimeToSystemTime(creationTime, &st_creation);
+    KERNEL32$FileTimeToSystemTime(modificationTime, &st_modification);
+    MSVCRT$_snprintf(dateStr, dateStrSize, "[C:%02d.%02d.%04d M:%02d.%02d.%04d]", 
+        st_creation.wDay, st_creation.wMonth, st_creation.wYear,
+        st_modification.wDay, st_modification.wMonth, st_modification.wYear);
+}
+static BOOL OutputSearchResult(const char* filepath, const FILETIME* filetime, const char* matchStart, const char* matchEnd, const char* lowercaseBuffer, const char* originalBuffer, DWORD bufferLen, SearchOptions* opts) {
+    if (opts && IsPathAlreadySeen(filepath, opts)) {
+        return FALSE; 
     }
-    
-    if (MSVCRT$strstr(normalized_path, ":\\Program Files")) {
-        // Check if it's root-level Program Files (not Program Files (x86) or subdirectories)
-        const char* pf_pos = MSVCRT$strstr(normalized_path, ":\\Program Files");
-        if (pf_pos && (MSVCRT$strlen(pf_pos) == 15 || (pf_pos[15] == '\\' || pf_pos[15] == ' '))) {
-            MSVCRT$free(normalized_path);
-            return FALSE;
+    size_t len = MSVCRT$strlen(filepath);
+    char* normalized = (char*)MSVCRT$malloc(len + 1);
+    char dateStr[35] = {0}; 
+    if (opts && opts->show_date && filetime) {
+        WIN32_FILE_ATTRIBUTE_DATA fileInfo;
+        FILETIME creationTime = *filetime; 
+        if (KERNEL32$GetFileAttributesExA(filepath, GetFileExInfoStandard, &fileInfo)) {
+            creationTime = fileInfo.ftCreationTime;
+        }
+        FormatFileDate(&creationTime, filetime, dateStr, sizeof(dateStr));
+    }
+    if (!normalized) { 
+        if (opts && opts->show_date && dateStr[0]) {
+            BeaconPrintf(CALLBACK_OUTPUT, "\n[+] %s %s\n", dateStr, filepath);
+        } else {
+            BeaconPrintf(CALLBACK_OUTPUT, "\n[+] %s\n", filepath);
+        }
+        if (opts) AddPathToSeen(filepath, opts);
+        return TRUE; 
+    }
+    MSVCRT$memcpy(normalized, filepath, len + 1);
+    NormalizePath(normalized);
+    if (matchStart && matchEnd && originalBuffer) {
+        size_t matchStartOffset = matchStart - lowercaseBuffer;
+        size_t matchEndOffset = matchEnd - lowercaseBuffer;
+        size_t contextStartOffset = (matchStartOffset < CONTEXT_BUFFER_SIZE) ? 0 : matchStartOffset - CONTEXT_BUFFER_SIZE;
+        size_t contextEndOffset = (matchEndOffset + CONTEXT_BUFFER_SIZE > bufferLen) ? bufferLen : matchEndOffset + CONTEXT_BUFFER_SIZE;
+        size_t ctxLen = contextEndOffset - contextStartOffset;
+        char* ctx = (char*)MSVCRT$malloc(ctxLen + 1);
+        if (ctx) {
+            MSVCRT$memcpy(ctx, originalBuffer + contextStartOffset, ctxLen);
+            ctx[ctxLen] = '\0';
+            if (opts && opts->show_date && dateStr[0]) {
+                BeaconPrintf(CALLBACK_OUTPUT, "\n[+] %s %s:\n\t ...%s...\n", dateStr, normalized, ctx);
+            } else {
+                BeaconPrintf(CALLBACK_OUTPUT, "\n[+] %s:\n\t ...%s...\n", normalized, ctx);
+            }
+            MSVCRT$free(ctx);
+        } else {
+            if (opts && opts->show_date && dateStr[0]) {
+                BeaconPrintf(CALLBACK_OUTPUT, "\n[+] %s %s\n", dateStr, normalized);
+            } else {
+                BeaconPrintf(CALLBACK_OUTPUT, "\n[+] %s\n", normalized);
+            }
+        }
+    } else {
+        if (opts && opts->show_date && dateStr[0]) {
+            BeaconPrintf(CALLBACK_OUTPUT, "\n[+] %s %s\n", dateStr, normalized);
+        } else {
+            BeaconPrintf(CALLBACK_OUTPUT, "\n[+] %s\n", normalized);
         }
     }
-    
-    // Exclude AppData directories inside Users
-    if (MSVCRT$strstr(normalized_path, ":\\Users") && MSVCRT$strstr(normalized_path, "\\AppData")) {
-        MSVCRT$free(normalized_path);
-        return FALSE;
-    }
-    
-    MSVCRT$free(normalized_path);
+    if (opts) AddPathToSeen(normalized, opts);
+    MSVCRT$free(normalized);
     return TRUE;
 }
-
-// Check if file matches date filter
 BOOL MatchesDateFilter(const FILETIME* filetime, SearchOptions* opts) {
-    if (!opts->has_date_filter) {
-        return TRUE;
-    }
-
+    if (!opts->has_date_filter) return TRUE;
     SYSTEMTIME st;
     KERNEL32$FileTimeToSystemTime(filetime, &st);
-
+    int file_date = st.wYear * 10000 + st.wMonth * 100 + st.wDay;
     if (opts->before_date.wYear != 0) {
-        // Before date: file date must be before before_date
-        if (st.wYear > opts->before_date.wYear) return FALSE;
-        if (st.wYear == opts->before_date.wYear && st.wMonth > opts->before_date.wMonth) return FALSE;
-        if (st.wYear == opts->before_date.wYear && st.wMonth == opts->before_date.wMonth && st.wDay >= opts->before_date.wDay) return FALSE;
-        return TRUE;
+        int before = opts->before_date.wYear * 10000 + opts->before_date.wMonth * 100 + opts->before_date.wDay;
+        return file_date < before;
     }
-
     if (opts->after_date.wYear != 0) {
-        // After date: file date must be after after_date
-        if (st.wYear < opts->after_date.wYear) return FALSE;
-        if (st.wYear == opts->after_date.wYear && st.wMonth < opts->after_date.wMonth) return FALSE;
-        if (st.wYear == opts->after_date.wYear && st.wMonth == opts->after_date.wMonth && st.wDay <= opts->after_date.wDay) return FALSE;
-        return TRUE;
+        int after = opts->after_date.wYear * 10000 + opts->after_date.wMonth * 100 + opts->after_date.wDay;
+        return file_date > after;
     }
-
     return TRUE;
 }
-
-// Search for keywords in file contents
-BOOL SearchFileContents(const char* filepath, SearchOptions* opts) {
+int SearchFileContents(const char* filepath, const FILETIME* filetime, SearchOptions* opts) {
     if (!opts->search_contents || opts->keyword_count == 0) {
-        return FALSE;
+        return 0;
     }
-
     HANDLE hFile = KERNEL32$CreateFileA(filepath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) {
-        return FALSE;
+        return 0;
     }
-
-    // Get file size
     DWORD fileSizeHigh = 0;
     DWORD fileSize = KERNEL32$GetFileSize(hFile, &fileSizeHigh);
     ULONGLONG totalSize = ((ULONGLONG)fileSizeHigh << 32) | fileSize;
-    
-    // Check if file is too large
     if (totalSize > MAX_CONTENT_BUFFER_SIZE || totalSize == 0) {
         KERNEL32$CloseHandle(hFile);
-        return FALSE;
+        return 0;
     }
-
-    // Allocate buffer
     char* buffer = (char*)MSVCRT$malloc((size_t)totalSize + 1);
     if (!buffer) {
         KERNEL32$CloseHandle(hFile);
-        return FALSE;
+        return 0;
     }
-
-    // Read file
     DWORD bytesRead = 0;
     if (!KERNEL32$ReadFile(hFile, buffer, (DWORD)totalSize, &bytesRead, NULL)) {
         MSVCRT$free(buffer);
         KERNEL32$CloseHandle(hFile);
-        return FALSE;
+        return 0;
     }
-    
     buffer[bytesRead] = '\0';
     KERNEL32$CloseHandle(hFile);
-
-    // Convert to lowercase for case-insensitive search
+    char* originalBuffer = (char*)MSVCRT$malloc((size_t)bytesRead + 1);
+    if (!originalBuffer) {
+        MSVCRT$free(buffer);
+        return 0;
+    }
+    MSVCRT$memcpy(originalBuffer, buffer, (size_t)bytesRead + 1);
     for (DWORD i = 0; i < bytesRead; i++) {
         buffer[i] = (char)MSVCRT$tolower((unsigned char)buffer[i]);
     }
-
-    // Search for keywords
-    BOOL found = FALSE;
+    char** lowerKeywords = (char**)MSVCRT$malloc(sizeof(char*) * opts->keyword_count);
+    if (!lowerKeywords) { MSVCRT$free(buffer); MSVCRT$free(originalBuffer); return 0; }
     for (int i = 0; i < opts->keyword_count; i++) {
         const char* kw = opts->keywords[i];
-        if (!kw) continue;
-        
-        // Check if keyword contains wildcards
+        if (!kw) { lowerKeywords[i] = NULL; continue; }
+        size_t len = MSVCRT$strlen(kw);
+        lowerKeywords[i] = (char*)MSVCRT$malloc(len + 1);
+        if (lowerKeywords[i]) {
+            for (size_t j = 0; j < len; j++) lowerKeywords[i][j] = (char)MSVCRT$tolower((unsigned char)kw[j]);
+            lowerKeywords[i][len] = '\0';
+        } else {
+            lowerKeywords[i] = NULL;
+        }
+    }
+    int totalMatches = 0;  
+    for (int i = 0; i < opts->keyword_count; i++) {
+        const char* kw = opts->keywords[i];
+        if (!kw || !lowerKeywords[i]) continue;
         if (HasWildcard(kw)) {
-            // Wildcard search: optimized algorithm using pattern segments
             size_t keywordLen = MSVCRT$strlen(kw);
             size_t bufferLen = bytesRead;
-            
-            // Convert keyword to lowercase for comparison
-            char* lowerKeyword = (char*)MSVCRT$malloc(keywordLen + 1);
-            if (!lowerKeyword) continue;
-            for (size_t j = 0; j < keywordLen; j++) {
-                lowerKeyword[j] = (char)MSVCRT$tolower((unsigned char)kw[j]);
-            }
-            lowerKeyword[keywordLen] = '\0';
-            
+            char* lowerKeyword = lowerKeywords[i];
             const char* bufferEnd = buffer + bufferLen;
-            const char* matchStart = NULL;
-            const char* matchEnd = NULL;
-            
-            // Optimized wildcard matching: split pattern by * and search segments
-            // This prevents infinite loops when pattern starts with *
-            
-            // Find first non-wildcard segment after leading wildcards
             const char* patternStart = lowerKeyword;
+            BOOL startsWithWildcard = (*lowerKeyword == '*' || *lowerKeyword == '?');
             while (*patternStart == '*' || *patternStart == '?') {
                 patternStart++;
             }
-            
-            // If pattern is all wildcards, match everything
             if (!*patternStart) {
-                matchStart = buffer;
-                matchEnd = buffer + (bufferLen > 100 ? 100 : bufferLen); // Limit match length
+                const char* matchStart = buffer;
+                const char* matchEnd = buffer + (bufferLen > 100 ? 100 : bufferLen); 
+                if (OutputSearchResult(filepath, filetime, matchStart, matchEnd, buffer, originalBuffer, (DWORD)bufferLen, opts)) {
+                    totalMatches++;
+                }
             } else {
-                // Find first character of first non-wildcard segment
                 char firstChar = *patternStart;
                 const char* searchStart = buffer;
                 const char* maxSearchPos = bufferEnd;
-                
-                // Limit search area for performance (use custom or default)
                 ULONGLONG maxSearchSize = (opts->wildcard_max_size > 0) ? opts->wildcard_max_size : WILDCARD_MAX_SEARCH_SIZE;
                 if (bufferLen > maxSearchSize) {
                     maxSearchPos = buffer + (size_t)maxSearchSize;
                 }
-                
-                // Try to find pattern starting from each occurrence of first character
                 int maxAttempts = (opts->wildcard_max_attempts > 0) ? opts->wildcard_max_attempts : WILDCARD_MAX_MATCH_ATTEMPTS;
                 int attempts = 0;
-                
-                while (searchStart < maxSearchPos && attempts < maxAttempts) {
-                    // Find next occurrence of first character
-                    while (searchStart < maxSearchPos && 
-                           MSVCRT$tolower((unsigned char)*searchStart) != firstChar) {
+                int matchCount = 0;
+                while (searchStart < maxSearchPos && attempts < maxAttempts && matchCount < MAX_MATCHES_PER_FILE) {
+                    while (searchStart < maxSearchPos && *searchStart != firstChar) {
                         searchStart++;
                     }
-                    
                     if (searchStart >= maxSearchPos) break;
-                    
-                    // Try matching pattern from this position
-                    const char* p = lowerKeyword;
-                    const char* t = searchStart;
-                    const char* lastStar = NULL;
-                    const char* lastStarPos = NULL;
-                    BOOL matched = TRUE;
-                    int backtrackCount = 0;
-                    int maxBacktrack = (opts->wildcard_max_backtrack > 0) ? opts->wildcard_max_backtrack : WILDCARD_MAX_BACKTRACK;
-                    
-                    while (*p && t < maxSearchPos && backtrackCount < maxBacktrack) {
-                        if (*p == '*') {
-                            // Skip consecutive stars
-                            while (*p == '*') p++;
-                            if (!*p) {
-                                // Pattern ends with *, match succeeded
-                                matchStart = searchStart;
-                                matchEnd = t;
+                    size_t patternLen = MSVCRT$strlen(lowerKeyword);
+                    size_t maxBackward = (patternLen < 100) ? patternLen : 100;
+                    const char* tryStart = startsWithWildcard && (searchStart - buffer) > maxBackward 
+                        ? searchStart - maxBackward 
+                        : (startsWithWildcard ? buffer : searchStart);
+                    BOOL foundMatch = FALSE;
+                    const char* matchStart = NULL;
+                    const char* matchEnd = NULL;
+                    const char* bestMatchStart = NULL;
+                    const char* bestMatchEnd = NULL;
+                    const char* actualMatchStart = NULL; 
+                    for (const char* testStart = tryStart; testStart <= searchStart; testStart++) {
+                        const char* p = lowerKeyword;
+                        const char* t = testStart;
+                        const char* lastStar = NULL;
+                        const char* lastStarPos = NULL;
+                        BOOL matched = TRUE;
+                        int backtrackCount = 0;
+                        int maxBacktrack = (opts->wildcard_max_backtrack > 0) ? opts->wildcard_max_backtrack : WILDCARD_MAX_BACKTRACK;
+                        const char* firstLetterPos = NULL;
+                        BOOL firstLetterFound = FALSE;
+                        while (*p && t < maxSearchPos && backtrackCount < maxBacktrack) {
+                            if (*p == '*') {
+                                while (*p == '*') p++;
+                                if (!*p) {
+                                    if (!bestMatchStart || testStart < bestMatchStart) {
+                                        bestMatchStart = testStart;
+                                        bestMatchEnd = t; 
+                                        actualMatchStart = firstLetterFound ? firstLetterPos : testStart;
+                                        foundMatch = TRUE;
+                                    }
+                                    break;
+                                }
+                                lastStar = p;
+                                lastStarPos = t;
+                            } else if (*p == '?' || *t == *p) { 
+                                if (!firstLetterFound && *p != '?') {
+                                    firstLetterPos = t;
+                                    firstLetterFound = TRUE;
+                                }
+                                p++;
+                                t++;
+                            } else if (lastStar) {
+                                p = lastStar;
+                                t = ++lastStarPos;
+                                backtrackCount++;
+                                firstLetterFound = FALSE;
+                                firstLetterPos = NULL;
+                            } else {
+                                matched = FALSE;
                                 break;
                             }
-                            lastStar = p;
-                            lastStarPos = t;
-                        } else if (*p == '?' || MSVCRT$tolower((unsigned char)*t) == *p) {
-                            p++;
-                            t++;
-                        } else if (lastStar) {
-                            // Backtrack to last star
-                            p = lastStar;
-                            t = ++lastStarPos;
-                            backtrackCount++;
-                        } else {
-                            matched = FALSE;
-                            break;
+                        }
+                        if (!foundMatch || testStart < bestMatchStart) {
+                            while (*p == '*') p++;
+                            if (matched && !*p && t <= maxSearchPos) {
+                                if (IsWordBoundary(testStart, t, buffer, (DWORD)bufferLen, lowerKeyword)) {
+                                    if (!bestMatchStart || testStart < bestMatchStart) {
+                                        bestMatchStart = testStart;
+                                        bestMatchEnd = t;
+                                        actualMatchStart = firstLetterFound ? firstLetterPos : testStart;
+                                        foundMatch = TRUE;
+                                    }
+                                }
+                            }
                         }
                     }
-                    
-                    // Check if pattern matched completely
-                    while (*p == '*') p++;
-                    if (matched && !*p && t <= maxSearchPos) {
-                        matchStart = searchStart;
-                        matchEnd = t;
-                        break;
+                    if (foundMatch && bestMatchStart && bestMatchEnd) {
+                        matchStart = actualMatchStart ? actualMatchStart : bestMatchStart;
+                        matchEnd = bestMatchEnd;
                     }
-                    
-                    // Move to next position
-                    searchStart++;
+                    if (foundMatch && matchStart && matchEnd) {
+                        if (OutputSearchResult(filepath, filetime, matchStart, matchEnd, buffer, originalBuffer, (DWORD)bufferLen, opts)) {
+                            matchCount++;
+                            totalMatches++;
+                        }
+                        const char* nextStart = matchEnd;
+                        if (nextStart <= matchStart) {
+                            nextStart = matchStart + 1;
+                        }
+                        if (nextStart <= searchStart) {
+                            nextStart = searchStart + 1;
+                        }
+                        searchStart = nextStart;
+                    } else {
+                        searchStart++;
+                    }
                     attempts++;
                 }
-            }
-            
-            if (matchStart && matchEnd) {
-                // Found match
-                found = TRUE;
-                char* normalized_filepath = (char*)MSVCRT$malloc(MSVCRT$strlen(filepath) + 1);
-                if (normalized_filepath) {
-                    MSVCRT$memcpy(normalized_filepath, filepath, MSVCRT$strlen(filepath) + 1);
-                    NormalizePath(normalized_filepath);
-                    
-                    // Extract context around match
-                    const char* start = matchStart - CONTEXT_BUFFER_SIZE;
-                    if (start < buffer) start = buffer;
-                    const char* end = matchEnd + CONTEXT_BUFFER_SIZE;
-                    if (end > bufferEnd) end = bufferEnd;
-                    
-                    size_t contextLen = end - start;
-                    char* context = (char*)MSVCRT$malloc(contextLen + 1);
-                    if (context) {
-                        MSVCRT$memcpy(context, start, contextLen);
-                        context[contextLen] = '\0';
-                        BeaconPrintf(CALLBACK_OUTPUT, "[+] %s:\n\t ...%s...\n", normalized_filepath, context);
-                        MSVCRT$free(context);
-                    } else {
-                        BeaconPrintf(CALLBACK_OUTPUT, "[+] %s\n", normalized_filepath);
-                    }
-                    MSVCRT$free(normalized_filepath);
-                } else {
-                    BeaconPrintf(CALLBACK_OUTPUT, "[+] %s\n", filepath);
+                if (matchCount >= MAX_MATCHES_PER_FILE) {
+                    BeaconPrintf(CALLBACK_OUTPUT, "[!] File %s: Reached maximum matches limit (%d) for pattern\n", filepath, MAX_MATCHES_PER_FILE);
                 }
             }
-            
-            MSVCRT$free(lowerKeyword);
         } else {
-            // Exact match: find whole word (case-insensitive)
             size_t keywordLen = MSVCRT$strlen(kw);
             if (keywordLen == 0) continue;
-            
-            // Convert keyword to lowercase for comparison
-            char* lowerKeyword = (char*)MSVCRT$malloc(keywordLen + 1);
-            if (!lowerKeyword) continue;
-            for (size_t j = 0; j < keywordLen; j++) {
-                lowerKeyword[j] = (char)MSVCRT$tolower((unsigned char)kw[j]);
-            }
-            lowerKeyword[keywordLen] = '\0';
-            
-            // Search for exact match (whole word)
+            char* lowerKeyword = lowerKeywords[i];
+            int matchCount = 0;
             const char* match = buffer;
-            while ((match = MSVCRT$strstr(match, lowerKeyword)) != NULL) {
-                // Check if it's a whole word (not part of another word)
+            while ((match = MSVCRT$strstr(match, lowerKeyword)) != NULL && matchCount < MAX_MATCHES_PER_FILE) {
                 BOOL isWordStart = (match == buffer || 
-                    (match > buffer && (MSVCRT$tolower((unsigned char)match[-1]) < 'a' || 
-                                       MSVCRT$tolower((unsigned char)match[-1]) > 'z')));
+                    (match > buffer && (match[-1] < 'a' || match[-1] > 'z')));
                 BOOL isWordEnd = (match + keywordLen >= buffer + bytesRead ||
-                    (MSVCRT$tolower((unsigned char)match[keywordLen]) < 'a' || 
-                     MSVCRT$tolower((unsigned char)match[keywordLen]) > 'z'));
-                
+                    (match[keywordLen] < 'a' || match[keywordLen] > 'z'));
                 if (isWordStart && isWordEnd) {
-                    // Found exact match
-                    found = TRUE;
-                    char* normalized_filepath = (char*)MSVCRT$malloc(MSVCRT$strlen(filepath) + 1);
-                    if (normalized_filepath) {
-                        MSVCRT$memcpy(normalized_filepath, filepath, MSVCRT$strlen(filepath) + 1);
-                        NormalizePath(normalized_filepath);
-                        
-                        // Extract context around match
-                        const char* start = match - CONTEXT_BUFFER_SIZE;
-                        if (start < buffer) start = buffer;
-                        const char* end = match + keywordLen + CONTEXT_BUFFER_SIZE;
-                        if (end > buffer + bytesRead) end = buffer + bytesRead;
-                        
-                        size_t contextLen = end - start;
-                        char* context = (char*)MSVCRT$malloc(contextLen + 1);
-                        if (context) {
-                            MSVCRT$memcpy(context, start, contextLen);
-                            context[contextLen] = '\0';
-                            BeaconPrintf(CALLBACK_OUTPUT, "[+] %s:\n\t ...%s...\n", normalized_filepath, context);
-                            MSVCRT$free(context);
-                        } else {
-                            BeaconPrintf(CALLBACK_OUTPUT, "[+] %s\n", normalized_filepath);
-                        }
-                        MSVCRT$free(normalized_filepath);
-                    } else {
-                        BeaconPrintf(CALLBACK_OUTPUT, "[+] %s\n", filepath);
+                    const char* matchEnd = match + keywordLen;
+                    if (OutputSearchResult(filepath, filetime, match, matchEnd, buffer, originalBuffer, bytesRead, opts)) {
+                        matchCount++;
+                        totalMatches++;
                     }
-                    break; // Only report first match
+                    match += keywordLen; 
+                } else {
+                    match++; 
                 }
-                match++; // Continue searching
             }
-            
-            MSVCRT$free(lowerKeyword);
+            if (matchCount >= MAX_MATCHES_PER_FILE) {
+                BeaconPrintf(CALLBACK_OUTPUT, "[!] File %s: Reached maximum matches limit (%d) for keyword\n", filepath, MAX_MATCHES_PER_FILE);
+            }
         }
-        
-        if (found) break; // Only report first keyword match
     }
-
+    for (int i = 0; i < opts->keyword_count; i++) MSVCRT$free(lowerKeywords[i]);
+    MSVCRT$free(lowerKeywords);
     MSVCRT$free(buffer);
-    return found;
+    MSVCRT$free(originalBuffer);
+    return totalMatches;
 }
-
-// Recursive file search
 void SearchDirectory(const char* dir_path, SearchOptions* opts) {
     WIN32_FIND_DATAA findData;
     HANDLE hFind;
     char search_path[MAX_PATH_LENGTH + 4];
     char file_path[MAX_PATH_LENGTH];
-
-    // Check if we've reached max results
-    if (opts->result_count >= MAX_RESULTS) {
-        return;
+    if (opts->search_contents) {
+        if (opts->result_count >= MAX_RESULTS) {
+            return;
+        }
+    } else {
+        if (opts->file_count >= MAX_RESULTS) {
+            return;
+        }
     }
-
-    // Build search path with bounds checking
     if (MSVCRT$strlen(dir_path) > MAX_PATH_LENGTH - 3) {
-        // Silently skip directories with paths too long
         return;
     }
     MSVCRT$_snprintf(search_path, sizeof(search_path), "%s\\*", dir_path);
-
     hFind = KERNEL32$FindFirstFileA(search_path, &findData);
     if (hFind == INVALID_HANDLE_VALUE) {
         DWORD error = KERNEL32$GetLastError();
-        // Only report errors that are not common noise
         if (error != ERROR_ACCESS_DENIED && error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) {
             BeaconPrintf(CALLBACK_ERROR, "[-] Cannot access directory %s (Error: %lu)\n", dir_path, error);
         }
         return;
     }
-
     do {
-        // Check result limit
-        if (opts->result_count >= MAX_RESULTS) {
-            break;
+        if (opts->search_contents) {
+            if (opts->result_count >= MAX_RESULTS) {
+                break;
+            }
+        } else {
+            if (opts->file_count >= MAX_RESULTS) {
+                break;
+            }
         }
-
-        // Skip . and ..
         if (MSVCRT$strcmp(findData.cFileName, ".") == 0 || 
             MSVCRT$strcmp(findData.cFileName, "..") == 0) {
             continue;
         }
-
-        // Build full path with bounds checking
         if (MSVCRT$strlen(dir_path) + MSVCRT$strlen(findData.cFileName) + 2 > MAX_PATH_LENGTH) {
-            // Silently skip files with paths too long
             continue;
         }
         MSVCRT$_snprintf(file_path, sizeof(file_path), "%s\\%s", dir_path, findData.cFileName);
-
-        // Check if it's a directory
+        file_path[MAX_PATH_LENGTH - 1] = '\0';
         if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             if (IsFolderValid(file_path, opts)) {
                 SearchDirectory(file_path, opts);
             }
             continue;
         }
-
-        // Check file extension
         if (!MatchesFiletype(file_path, opts)) {
             continue;
         }
-
-        // Check file size
         ULONGLONG file_size = ((ULONGLONG)findData.nFileSizeHigh << 32) | findData.nFileSizeLow;
         ULONGLONG file_size_kb = file_size / 1024;
         if (file_size_kb > opts->max_file_size_kb && opts->search_contents) {
             continue;
         }
-
-        // Check date filter
         if (!MatchesDateFilter(&findData.ftLastWriteTime, opts)) {
             continue;
         }
-
-        // Check if filename matches keyword
-        // If no keywords specified, match all files by name
         BOOL nameMatch = (opts->keyword_count == 0) ? TRUE : MatchesKeyword(findData.cFileName, opts);
-        // If strict VBA macro check is enabled (-v), only report Office files that actually contain VBA (OOXML only here)
         if (opts->check_for_macro) {
             if (!CheckForVBAMacrosStrict(file_path, FALSE)) {
                 continue;
             }
         }
-
-        if (nameMatch) {
-            // Normalize path before output (remove double backslashes)
-            NormalizePath(file_path);
-            BeaconPrintf(CALLBACK_OUTPUT, "[+] %s\n", file_path);
-            opts->result_count++;
-        }
-
-        // If searching contents, also search in file contents (for all files, not just name matches)
+        int contentMatches = 0;
         if (opts->search_contents) {
-            if (SearchFileContents(file_path, opts)) {
-                // Only count if not already found by name
-                if (!nameMatch) {
-                    opts->result_count++;
-                }
-            }
+            contentMatches = SearchFileContents(file_path, &findData.ftLastWriteTime, opts);
         }
-
+        if (contentMatches > 0) {
+            opts->result_count += contentMatches;
+            opts->file_count++;  
+        } else if (nameMatch && !opts->search_contents) {
+            if (IsPathAlreadySeen(file_path, opts)) {
+                continue; 
+            }
+            if (opts->file_count >= MAX_RESULTS) {
+                break;
+            }
+            NormalizePath(file_path);
+            size_t pathLen = MSVCRT$strlen(file_path);
+            if (pathLen < MAX_PATH_LENGTH) {
+                file_path[pathLen] = '\0';
+            } else {
+                file_path[MAX_PATH_LENGTH - 1] = '\0';
+            }
+            char dateStr[35] = {0}; 
+            if (opts->show_date) {
+                FormatFileDate(&findData.ftCreationTime, &findData.ftLastWriteTime, dateStr, sizeof(dateStr));
+            }
+            if (opts->show_date && dateStr[0]) {
+                BeaconPrintf(CALLBACK_OUTPUT, "\n[+] %s %s\n", dateStr, file_path);
+            } else {
+                BeaconPrintf(CALLBACK_OUTPUT, "\n[+] %s\n", file_path);
+            }
+            AddPathToSeen(file_path, opts);
+            opts->file_count++;   
+        }
     } while (KERNEL32$FindNextFileA(hFind, &findData));
-
     KERNEL32$FindClose(hFind);
 }
-
-// Trim quotes from beginning and end of string (in-place)
 void TrimQuotes(char* str) {
-    if (!str || MSVCRT$strlen(str) == 0) return;
-    
-    size_t len = MSVCRT$strlen(str);
-    size_t start = 0;
-    size_t end = len;
-    
-    // Remove leading quotes
-    while (start < len && (str[start] == '\'' || str[start] == '\"')) {
-        start++;
-    }
-    
-    // Remove trailing quotes
-    while (end > start && (str[end - 1] == '\'' || str[end - 1] == '\"')) {
-        end--;
-    }
-    
-    // Shift string if needed
-    if (start > 0) {
-        size_t i;
-        for (i = 0; i < (end - start); i++) {
-            str[i] = str[start + i];
-        }
-        str[i] = '\0';
-    } else if (end < len) {
-        str[end] = '\0';
+    if (!str || !*str) return;
+    char* start = str;
+    while (*start == '\'' || *start == '\"') start++;
+    if (!*start) { *str = '\0'; return; } 
+    char* end = start;
+    while (*end) end++; 
+    while (end > start && (end[-1] == '\'' || end[-1] == '\"')) end--;
+    if (start != str) {
+        size_t len = end - start;
+        MSVCRT$memcpy(str, start, len);
+        str[len] = '\0';
+    } else {
+        *end = '\0'; 
     }
 }
-
-// Normalize path by replacing double backslashes with single ones
 void NormalizePath(char* path) {
-    if (!path || MSVCRT$strlen(path) == 0) return;
-    
-    int write_pos = 0;
-    for (int read_pos = 0; path[read_pos]; read_pos++) {
-        if (path[read_pos] == '\\' && path[read_pos + 1] == '\\') {
-            // Skip double backslash, write only one
-            path[write_pos++] = '\\';
-            read_pos++; // Skip the second backslash
+    if (!path || !*path) return;
+    char* write = path;
+    const char* read = path;
+    while (*read) {
+        if (*read == '\\' && read[1] == '\\') {
+            *write++ = '\\';
+            read += 2; 
         } else {
-            path[write_pos++] = path[read_pos];
+            *write++ = *read++;
         }
     }
-    path[write_pos] = '\0';
+    *write = '\0';
 }
-
-// Parse comma-separated list
-void ParseCSVList(char* str, char*** list, int* count) {
-    if (!str || MSVCRT$strlen(str) == 0) {
-        *list = NULL;
-        *count = 0;
+void GetCanonicalPath(const char* filepath, char* canonical, size_t canonicalSize) {
+    if (!filepath || !canonical || canonicalSize == 0) {
+        if (canonical && canonicalSize > 0) canonical[0] = '\0';
         return;
     }
-
-    // Count items
-    int item_count = 1;
-    for (int i = 0; str[i]; i++) {
-        if (str[i] == ',') item_count++;
+    DWORD len = KERNEL32$GetFullPathNameA(filepath, (DWORD)canonicalSize, canonical, NULL);
+    if (len == 0 || len >= canonicalSize) {
+        size_t pathLen = MSVCRT$strlen(filepath);
+        if (pathLen >= canonicalSize) pathLen = canonicalSize - 1;
+        MSVCRT$memcpy(canonical, filepath, pathLen);
+        canonical[pathLen] = '\0';
     }
-
+    NormalizePath(canonical);
+    BOOL is_all_users = FALSE;
+    size_t prefix_len = 0;
+    if (MSVCRT$_strnicmp(canonical, "C:\\Users\\All Users", 19) == 0) {
+        if (canonical[19] == '\\' || canonical[19] == '\0') {
+            is_all_users = TRUE;
+            prefix_len = 20; 
+            if (canonical[19] == '\0') prefix_len = 19; 
+        }
+    }
+    else if (MSVCRT$strncmp(canonical, "C:\\Users\\", 10) == 0) {
+        const unsigned char* check = (const unsigned char*)(canonical + 10);
+        const unsigned char vse_pattern[] = {0xD0, 0x92, 0xD1, 0x81, 0xD0, 0xB5, 0x20, 0xD0, 0xBF, 0xD0, 0xBE, 0xD0, 0xBB, 0xD1, 0x8C, 0xD0, 0xB7, 0xD0, 0xBE, 0xD0, 0xB2, 0xD0, 0xB0, 0xD1, 0x82, 0xD0, 0xB5, 0xD0, 0xBB, 0xD0, 0xB8};
+        if (MSVCRT$memcmp(check, vse_pattern, sizeof(vse_pattern)) == 0) {
+            if (canonical[10 + sizeof(vse_pattern)] == '\\' || canonical[10 + sizeof(vse_pattern)] == '\0') {
+                is_all_users = TRUE;
+                prefix_len = 10 + sizeof(vse_pattern) + 1; 
+                if (canonical[10 + sizeof(vse_pattern)] == '\0') prefix_len = 10 + sizeof(vse_pattern);
+            }
+        }
+    }
+    if (is_all_users && prefix_len > 0) {
+        size_t remaining_len = MSVCRT$strlen(canonical + prefix_len);
+        if (remaining_len + 16 < canonicalSize) { 
+            char temp[MAX_PATH_LENGTH];
+            MSVCRT$memcpy(temp, "C:\\ProgramData\\", 16);
+            if (remaining_len > 0) {
+                MSVCRT$memcpy(temp + 15, canonical + prefix_len, remaining_len + 1);
+            } else {
+                temp[15] = '\0';
+            }
+            MSVCRT$memcpy(canonical, temp, MSVCRT$strlen(temp) + 1);
+        }
+    }
+    for (char* p = canonical; *p; p++) {
+        if ((unsigned char)*p < 128) { 
+            *p = (char)MSVCRT$tolower((unsigned char)*p);
+        }
+    }
+}
+BOOL IsPathAlreadySeen(const char* filepath, SearchOptions* opts) {
+    if (!filepath || !opts) return FALSE;
+    if (!opts->seen_paths) {
+        opts->seen_paths_capacity = 256;
+        opts->seen_paths = (char**)MSVCRT$malloc(sizeof(char*) * opts->seen_paths_capacity);
+        if (!opts->seen_paths) return FALSE; 
+        opts->seen_paths_count = 0;
+    }
+    char canonical[MAX_PATH_LENGTH];
+    GetCanonicalPath(filepath, canonical, sizeof(canonical));
+    for (int i = 0; i < opts->seen_paths_count; i++) {
+        if (opts->seen_paths[i] && MSVCRT$strcmp(opts->seen_paths[i], canonical) == 0) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+void AddPathToSeen(const char* filepath, SearchOptions* opts) {
+    if (!filepath || !opts) return;
+    if (!opts->seen_paths) {
+        opts->seen_paths_capacity = 256; 
+        opts->seen_paths = (char**)MSVCRT$malloc(sizeof(char*) * opts->seen_paths_capacity);
+        if (!opts->seen_paths) return;
+        opts->seen_paths_count = 0;
+    }
+    if (opts->seen_paths_count >= opts->seen_paths_capacity) {
+        int new_capacity = opts->seen_paths_capacity * 2;
+        char** new_array = (char**)MSVCRT$realloc(opts->seen_paths, sizeof(char*) * new_capacity);
+        if (!new_array) return; 
+        opts->seen_paths = new_array;
+        opts->seen_paths_capacity = new_capacity;
+    }
+    char canonical[MAX_PATH_LENGTH];
+    GetCanonicalPath(filepath, canonical, sizeof(canonical));
+    size_t len = MSVCRT$strlen(canonical);
+    opts->seen_paths[opts->seen_paths_count] = (char*)MSVCRT$malloc(len + 1);
+    if (opts->seen_paths[opts->seen_paths_count]) {
+        MSVCRT$memcpy(opts->seen_paths[opts->seen_paths_count], canonical, len + 1);
+        opts->seen_paths_count++;
+    }
+}
+void ParseCSVList(char* str, char*** list, int* count) {
+    if (!str || !*str) { *list = NULL; *count = 0; return; }
+    int item_count = 1;
+    for (int i = 0; str[i]; i++) if (str[i] == ',') item_count++;
     *list = (char**)MSVCRT$malloc(sizeof(char*) * item_count);
     *count = item_count;
-
-    // Create a copy since strtok modifies the string
+    if (!*list) { *count = 0; return; }
     size_t len = MSVCRT$strlen(str);
     char* str_copy = (char*)MSVCRT$malloc(len + 1);
-    if (!str_copy) {
-        MSVCRT$free(*list);
-        *list = NULL;
-        *count = 0;
-        return;
-    }
+    if (!str_copy) { MSVCRT$free(*list); *list = NULL; *count = 0; return; }
     MSVCRT$memcpy(str_copy, str, len + 1);
-
-    // Parse items
     char* token = MSVCRT$strtok(str_copy, ",");
     int idx = 0;
     while (token && idx < item_count) {
-        // Trim whitespace
         while (*token == ' ') token++;
         char* end = token + MSVCRT$strlen(token) - 1;
         while (end > token && *end == ' ') *end-- = '\0';
-        
-        // Trim quotes
         TrimQuotes(token);
-        
-        // Normalize path (replace double backslashes with single ones)
         NormalizePath(token);
-
-        // Copy the token
         size_t token_len = MSVCRT$strlen(token);
         (*list)[idx] = (char*)MSVCRT$malloc(token_len + 1);
         if ((*list)[idx]) {
@@ -671,85 +723,62 @@ void ParseCSVList(char* str, char*** list, int* count) {
         token = MSVCRT$strtok(NULL, ",");
     }
     *count = idx;
-    
     MSVCRT$free(str_copy);
 }
-
-// Parse date string (dd.MM.yyyy - Russian format)
+static char* AllocString(const char* src) {
+    if (!src) return NULL;
+    size_t len = MSVCRT$strlen(src);
+    char* dst = (char*)MSVCRT$malloc(len + 1);
+    if (dst) {
+        MSVCRT$memcpy(dst, src, len + 1);
+    }
+    return dst;
+}
 BOOL ParseDate(const char* date_str, SYSTEMTIME* st) {
-    if (MSVCRT$strlen(date_str) != 10) return FALSE;
-    if (date_str[2] != '.' || date_str[5] != '.') return FALSE;
-
-    // Russian format: dd.MM.yyyy
+    if (MSVCRT$strlen(date_str) != 10 || date_str[2] != '.' || date_str[5] != '.') return FALSE;
+    st->wDayOfWeek = st->wHour = st->wMinute = st->wSecond = st->wMilliseconds = 0;
     st->wDay = (WORD)((date_str[0] - '0') * 10 + (date_str[1] - '0'));
     st->wMonth = (WORD)((date_str[3] - '0') * 10 + (date_str[4] - '0'));
-    st->wYear = (WORD)((date_str[6] - '0') * 1000 + (date_str[7] - '0') * 100 + 
-                       (date_str[8] - '0') * 10 + (date_str[9] - '0'));
-    st->wDayOfWeek = 0;
-    st->wHour = 0;
-    st->wMinute = 0;
-    st->wSecond = 0;
-    st->wMilliseconds = 0;
-
-    return (st->wYear >= 1900 && st->wYear <= 9999 && 
-            st->wMonth >= 1 && st->wMonth <= 12 && 
-            st->wDay >= 1 && st->wDay <= 31);
+    st->wYear = (WORD)((date_str[6] - '0') * 1000 + (date_str[7] - '0') * 100 + (date_str[8] - '0') * 10 + (date_str[9] - '0'));
+    return (st->wYear >= 1900 && st->wYear <= 9999 && st->wMonth >= 1 && st->wMonth <= 12 && st->wDay >= 1 && st->wDay <= 31);
 }
-
 void go(char* args, int len) {
     datap parser;
     BeaconDataParse(&parser, args, len);
-
-    // New: raw cmdline for flag validation
     char* raw_cmdline = BeaconDataExtract(&parser, NULL);
-
     SearchOptions opts = {0};
-    opts.max_file_size_kb = 1024; // Default 1MB
+    opts.max_file_size_kb = 1024; 
     opts.system_dirs = FALSE;
     opts.search_contents = FALSE;
     opts.check_for_macro = FALSE;
     opts.has_date_filter = FALSE;
+    opts.show_date = FALSE;
     opts.result_count = 0;
-    // Wildcard performance defaults (0 = use constants from header)
+    opts.file_count = 0;
     opts.wildcard_max_attempts = 0;
     opts.wildcard_max_size = 0;
     opts.wildcard_max_backtrack = 0;
-
-    // Validate flags from raw_cmdline against whitelist
-    if (raw_cmdline && MSVCRT$strlen(raw_cmdline) > 0) {
+    opts.seen_paths = NULL;
+    opts.seen_paths_count = 0;
+    opts.seen_paths_capacity = 0;
+    if (raw_cmdline && *raw_cmdline) {
         const char* p = raw_cmdline;
         while (*p) {
-            if (*p == '-') {
-                const char* start = p;
-                p++;
-                const char* f = p;
-                while (*p && *p != ' ' && *p != '\t') p++;
-                size_t flen = (size_t)(p - start);
-                // Copy flag token
-                if (flen > 0 && flen < 64) {
-                    char flag[64];
-                    for (size_t i = 0; i < flen && i < 63; i++) flag[i] = start[i];
-                    flag[(flen < 63 ? flen : 63)] = '\0';
-                    // Whitelist: -d -f -k -c -m -s -b -a -v -W -S -B
-                    BOOL ok = FALSE;
-                    if (MSVCRT$strncmp(flag, "-d", 2) == 0 || MSVCRT$strncmp(flag, "-f", 2) == 0 || MSVCRT$strncmp(flag, "-k", 2) == 0 ||
-                        MSVCRT$strncmp(flag, "-c", 2) == 0 || MSVCRT$strncmp(flag, "-m", 2) == 0 || MSVCRT$strncmp(flag, "-s", 2) == 0 ||
-                        MSVCRT$strncmp(flag, "-b", 2) == 0 || MSVCRT$strncmp(flag, "-a", 2) == 0 || MSVCRT$strncmp(flag, "-v", 2) == 0 ||
-                        MSVCRT$strncmp(flag, "-W", 2) == 0 || MSVCRT$strncmp(flag, "-S", 2) == 0 || MSVCRT$strncmp(flag, "-B", 2) == 0) {
-                        ok = TRUE;
-                    }
-                    if (!ok) {
-                        BeaconPrintf(CALLBACK_ERROR, "Invalid flag: %s\n", flag);
-                        return; // Abort execution on unknown flag
-                    }
+            if (*p == '-' && p[1]) {
+                const char valid_flags[] = "-d-f-k-c-m-s-b-a-v-D-W-S-B";
+                BOOL valid = FALSE;
+                for (int i = 0; i < (int)sizeof(valid_flags) - 1; i += 2) {
+                    if (p[0] == valid_flags[i] && p[1] == valid_flags[i+1]) { valid = TRUE; break; }
                 }
-            } else {
-                p++;
-            }
+                if (!valid) {
+                    char flag[3] = {p[0], p[1], '\0'};
+                    BeaconPrintf(CALLBACK_ERROR, "Invalid flag: %s\n", flag);
+                    return;
+                }
+                while (*p && *p != ' ' && *p != '\t') p++;
+            } else p++;
         }
     }
-
-    // Parse arguments
     char* directories_str = BeaconDataExtract(&parser, NULL);
     char* filetypes_str = BeaconDataExtract(&parser, NULL);
     char* keywords_str = BeaconDataExtract(&parser, NULL);
@@ -759,103 +788,78 @@ void go(char* args, int len) {
     char* before_date_str = BeaconDataExtract(&parser, NULL);
     char* after_date_str = BeaconDataExtract(&parser, NULL);
     int check_macro_int = BeaconDataInt(&parser);
+    int show_date_int = BeaconDataInt(&parser);
     int wildcard_attempts_int = BeaconDataInt(&parser);
     int wildcard_size_int = BeaconDataInt(&parser);
     int wildcard_backtrack_int = BeaconDataInt(&parser);
-
     opts.search_contents = (search_contents_int != 0);
     opts.system_dirs = (system_dirs_int != 0);
     opts.check_for_macro = (check_macro_int != 0);
-    if (max_filesize_int > 0) {
-        opts.max_file_size_kb = (ULONGLONG)max_filesize_int;
-    }
-    
-    // Parse wildcard performance tuning parameters
-    if (wildcard_attempts_int > 0) {
-        opts.wildcard_max_attempts = wildcard_attempts_int;
-    }
-    if (wildcard_size_int > 0) {
-        opts.wildcard_max_size = (ULONGLONG)wildcard_size_int * 1024; // Convert KB to bytes
-    }
-    if (wildcard_backtrack_int > 0) {
-        opts.wildcard_max_backtrack = wildcard_backtrack_int;
-    }
-
-    // Parse CSV lists
+    opts.show_date = (show_date_int != 0);
+    if (max_filesize_int > 0) opts.max_file_size_kb = (ULONGLONG)max_filesize_int;
+    if (wildcard_attempts_int > 0) opts.wildcard_max_attempts = wildcard_attempts_int;
+    if (wildcard_size_int > 0) opts.wildcard_max_size = (ULONGLONG)wildcard_size_int * 1024;
+    if (wildcard_backtrack_int > 0) opts.wildcard_max_backtrack = wildcard_backtrack_int;
     if (directories_str && MSVCRT$strlen(directories_str) > 0) {
         ParseCSVList(directories_str, &opts.directories, &opts.dir_count);
     } else {
-        // Default: C:\ drive only
         opts.dir_count = 1;
         opts.directories = (char**)MSVCRT$malloc(sizeof(char*) * 1);
-        opts.directories[0] = (char*)MSVCRT$malloc(4);
-        MSVCRT$memcpy(opts.directories[0], "C:\\", 4);
+        if (opts.directories) {
+            opts.directories[0] = AllocString("C:\\");
+        }
     }
-
     if (filetypes_str && MSVCRT$strlen(filetypes_str) > 0) {
         ParseCSVList(filetypes_str, &opts.filetypes, &opts.filetype_count);
     } else {
-        // If -v (strict macro check) is enabled and no filetypes provided,
-        // default to Office formats. Otherwise keep generic defaults.
         if (opts.check_for_macro) {
+            const char* default_types[] = {".doc", ".xls", ".docm", ".xlsm"};
             opts.filetype_count = 4;
             opts.filetypes = (char**)MSVCRT$malloc(sizeof(char*) * 4);
-            opts.filetypes[0] = (char*)MSVCRT$malloc(5);
-            opts.filetypes[1] = (char*)MSVCRT$malloc(5);
-            opts.filetypes[2] = (char*)MSVCRT$malloc(6);
-            opts.filetypes[3] = (char*)MSVCRT$malloc(6);
-            MSVCRT$memcpy(opts.filetypes[0], ".doc", 5);
-            MSVCRT$memcpy(opts.filetypes[1], ".xls", 5);
-            MSVCRT$memcpy(opts.filetypes[2], ".docm", 6);
-            MSVCRT$memcpy(opts.filetypes[3], ".xlsm", 6);
+            if (opts.filetypes) {
+                for (int i = 0; i < 4; i++) {
+                    opts.filetypes[i] = AllocString(default_types[i]);
+                }
+            }
         } else {
-            // Default: .txt and .docx
+            const char* default_types[] = {".txt", ".docx"};
             opts.filetype_count = 2;
             opts.filetypes = (char**)MSVCRT$malloc(sizeof(char*) * 2);
-            opts.filetypes[0] = (char*)MSVCRT$malloc(5);
-            opts.filetypes[1] = (char*)MSVCRT$malloc(6);
-            MSVCRT$memcpy(opts.filetypes[0], ".txt", 5);
-            MSVCRT$memcpy(opts.filetypes[1], ".docx", 6);
+            if (opts.filetypes) {
+                for (int i = 0; i < 2; i++) {
+                    opts.filetypes[i] = AllocString(default_types[i]);
+                }
+            }
         }
     }
-
     if (keywords_str && MSVCRT$strlen(keywords_str) > 0) {
         ParseCSVList(keywords_str, &opts.keywords, &opts.keyword_count);
     } else {
-        // No keywords specified - match all filenames when searching by extension
         opts.keyword_count = 0;
         opts.keywords = NULL;
     }
-
-    // Parse dates
-    if (before_date_str && MSVCRT$strlen(before_date_str) > 0) {
-        if (!ParseDate(before_date_str, &opts.before_date)) {
-            BeaconPrintf(CALLBACK_ERROR, "[-] Invalid before date format: %s (expected: yyyy-MM-dd)\n", before_date_str);
-        } else {
-            opts.has_date_filter = TRUE;
-        }
+    if (before_date_str && *before_date_str) {
+        if (ParseDate(before_date_str, &opts.before_date)) opts.has_date_filter = TRUE;
+        else BeaconPrintf(CALLBACK_ERROR, "[-] Invalid before date format: %s\n", before_date_str);
     }
-
-    if (after_date_str && MSVCRT$strlen(after_date_str) > 0) {
-        if (!ParseDate(after_date_str, &opts.after_date)) {
-            BeaconPrintf(CALLBACK_ERROR, "[-] Invalid after date format: %s (expected: yyyy-MM-dd)\n", after_date_str);
-        } else {
-            opts.has_date_filter = TRUE;
-        }
+    if (after_date_str && *after_date_str) {
+        if (ParseDate(after_date_str, &opts.after_date)) opts.has_date_filter = TRUE;
+        else BeaconPrintf(CALLBACK_ERROR, "[-] Invalid after date format: %s\n", after_date_str);
     }
-
-    BeaconPrintf(CALLBACK_OUTPUT, "[*] Starting SauronEye search...\n");
-    BeaconPrintf(CALLBACK_OUTPUT, "[*] Directories: ");
-    for (int i = 0; i < opts.dir_count; i++) {
-        BeaconPrintf(CALLBACK_OUTPUT, "%s ", opts.directories[i]);
-    }
+    BeaconPrintf(CALLBACK_OUTPUT, "[*] Starting SauronEye search...\n[*] Directories: ");
+    for (int i = 0; i < opts.dir_count; i++) BeaconPrintf(CALLBACK_OUTPUT, "%s ", opts.directories[i]);
     BeaconPrintf(CALLBACK_OUTPUT, "\n");
-
-    // Search each directory
     for (int i = 0; i < opts.dir_count; i++) {
-        if (opts.result_count >= MAX_RESULTS) {
-            BeaconPrintf(CALLBACK_OUTPUT, "[!] Reached maximum results limit (%d)\n", MAX_RESULTS);
-            break;
+        if (opts.search_contents) {
+            if (opts.result_count >= MAX_RESULTS) {
+                BeaconPrintf(CALLBACK_OUTPUT, "[!] Reached maximum results limit (%d)\n", MAX_RESULTS);
+                break;
+            }
+        } else {
+            if (opts.file_count >= MAX_RESULTS) {
+                BeaconPrintf(CALLBACK_OUTPUT, "[!] Reached maximum files limit (%d)\n", MAX_RESULTS);
+                break;
+            }
         }
         if (SHLWAPI$PathFileExistsA(opts.directories[i])) {
             BeaconPrintf(CALLBACK_OUTPUT, "[*] Searching in: %s\n", opts.directories[i]);
@@ -864,7 +868,17 @@ void go(char* args, int len) {
             BeaconPrintf(CALLBACK_ERROR, "[-] Directory does not exist: %s\n", opts.directories[i]);
         }
     }
-
-    BeaconPrintf(CALLBACK_OUTPUT, "[*] Search completed. Found %d results.\n", opts.result_count);
+    if (opts.search_contents && opts.result_count > 0) {
+        BeaconPrintf(CALLBACK_OUTPUT, "\n[*] Search completed. Found %d results in %d files.\n", opts.result_count, opts.file_count);
+    } else {
+        BeaconPrintf(CALLBACK_OUTPUT, "\n[*] Search completed. Found %d files.\n", opts.file_count);
+    }
+    if (opts.seen_paths) {
+        for (int i = 0; i < opts.seen_paths_count; i++) {
+            if (opts.seen_paths[i]) {
+                MSVCRT$free(opts.seen_paths[i]);
+            }
+        }
+        MSVCRT$free(opts.seen_paths);
+    }
 }
-

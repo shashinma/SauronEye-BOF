@@ -1,14 +1,15 @@
 # SauronEyeBOF
 
 A file search tool ported from SauronEye to BOF format. Searches directories for files containing specific keywords:
-- Search files by name patterns (supports wildcards * and ?)
+- Search files by name patterns (supports wildcards * )
+- Search file contents for keywords (with `-c` flag, supports wildcards * )
 - Filter by file extensions
 - Filter by file modification date
 - Exclude system directories (Windows, AppData, Program Files)
 - Configurable max file size
 
 ```
-sauroneye [-d directories] [-f filetypes] [-k keywords] [-c] [-m maxfilesize] [-s] [-b beforedate] [-a afterdate] [-v] [-W wildcardattempts] [-S wildcardsize] [-B wildcardbacktrack]
+sauroneye [-d directories] [-f filetypes] [-k keywords] [-c] [-m maxfilesize] [-s] [-b beforedate] [-a afterdate] [-v] [-D] [-W wildcardattempts] [-S wildcardsize] [-B wildcardbacktrack]
 ```
 
 Options:
@@ -21,6 +22,7 @@ Options:
 - `-b beforedate`: Filter files modified before date (format: dd.MM.yyyy)
 - `-a afterdate`: Filter files modified after date (format: dd.MM.yyyy)
 - `-v`: Check for VBA macros in Office files using OOXML detection (no OLE, stealthier)
+- `-D`: Show file creation and modification dates in output. Format: `[C:dd.MM.yyyy M:dd.MM.yyyy]` where C: is creation date and M: is modification date
 - `-W wildcardattempts`: Maximum pattern matching attempts for wildcard search (default: 1000). Increase for complex patterns
 - `-S wildcardsize`: Maximum search area in KB for large files when using wildcards (default: 200KB). Increase to search more of large files
 - `-B wildcardbacktrack`: Maximum backtracking operations for wildcard matching (default: 1000). Increase for complex patterns

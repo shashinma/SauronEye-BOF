@@ -1,4 +1,6 @@
-# SauronEyeBOF ([@Adaptix-Framework](https://github.com/Adaptix-Framework))
+# SauronEyeBOF
+> #### Developed for [@Adaptix-Framework](https://github.com/Adaptix-Framework)
+<br>
 
 A file search tool ported from SauronEye to BOF format. Searches directories for files containing specific keywords:
 - Search files by name patterns (supports wildcards * )

@@ -49,9 +49,3 @@ cmd_sauroneye.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines) {
 var b_group_test = ax.create_commands_group("PostEx-BOF", [cmd_fw, cmd_screenshot, cmd_sauroneye]);
 ax.register_commands_group(b_group_test, ["beacon", "gopher"], ["windows"], []);
 
-/// MENU
-
-let screen_access_action = menu.create_action("Screenshot", function(agents_id) { agents_id.forEach(id => ax.execute_command(id, "screenshot_bof")) });
-menu.add_session_access(screen_access_action, ["beacon"]);
-let g_screen_access_action = menu.create_action("Screenshot", function(agents_id) { agents_id.forEach(id => ax.execute_command(id, "screenshot")) });
-menu.add_session_access(g_screen_access_action, ["gopher"]);
